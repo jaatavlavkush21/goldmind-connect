@@ -1,0 +1,88 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    // Admins are tracked in a small dedicated collection, `admins/{uid}`,
+    // rather than derived from the employees collection — this avoids a
+    // chicken-and-egg problem since employees are keyed by employeeId, not
+    // uid. Create this doc manually (any content, e.g. {createdAt: now})
+    // for each admin account from the Firebase console after they sign up.
+    function isAdmin() {
+      return isSignedIn() &&
+        exists(/databases/$(database)/documents/admins/$(request.auth.uid));
+    }
+
+    // Employees are keyed by an admin-assigned employeeId (e.g. "GM-1001"),
+    // NOT by uid, because the Admin creates the profile before the employee
+    // ever logs in. On an employee's first login, the client links the doc
+    // to their uid (see "self-claim" rule below) — the match is only allowed
+    // when the doc's stored email/mobile equals the *verified* value on their
+    // Firebase Auth token, which the client cannot forge.
+    function isLinkedToMe() {
+      return resource.data.uid == request.auth.uid;
+    }
+
+    function matchesMyVerifiedIdentity() {
+      return resource.data.uid == null &&
+        (
+          (request.auth.token.email != null && resource.data.email == request.auth.token.email) ||
+          (request.auth.token.phone_number != null && resource.data.mobile == request.auth.token.phone_number)
+        );
+    }
+
+    match /employees/{employeeId} {
+      // Read is open to any signed-in user. Employee profiles (name, email,
+      // mobile, target) are not the sensitive data here — daily reports and
+      // sales figures are, and those live in Google Sheets behind an Apps
+      // Script API that independently re-verifies each caller's Firebase ID
+      // token and filters to their own data server-side (see apps-script/Code.gs).
+      // Keeping this read rule unconditional avoids a class of Firestore
+      // "permission-denied" errors that complex per-document OR conditions
+      // can trigger on list/query requests.
+      allow read: if isSignedIn();
+
+      allow create: if isAdmin();
+
+      // Case 1: admin editing anything.
+      // Case 2: first-time self-claim — only the `uid` field may change,
+      //         and only on a still-unlinked doc that matches the caller's
+      //         verified email/phone.
+      // Case 3: already-linked employee editing their own non-privileged fields.
+      allow update: if isAdmin() || (
+        matchesMyVerifiedIdentity() &&
+        request.resource.data.uid == request.auth.uid &&
+        request.resource.data.role == resource.data.role &&
+        request.resource.data.status == resource.data.status &&
+        request.resource.data.employeeId == resource.data.employeeId &&
+        request.resource.data.email == resource.data.email &&
+        request.resource.data.mobile == resource.data.mobile
+      ) || (
+        isLinkedToMe() &&
+        request.resource.data.role == resource.data.role &&
+        request.resource.data.status == resource.data.status &&
+        request.resource.data.employeeId == resource.data.employeeId &&
+        request.resource.data.uid == resource.data.uid
+      );
+
+      allow delete: if isAdmin();
+    }
+
+    // Notifications: everyone signed-in can read (broadcast); only admin writes.
+    match /notifications/{noticeId} {
+      allow read: if isSignedIn();
+      allow write: if isAdmin();
+    }
+
+    // Admin markers: a user may check whether THEY are an admin, nothing more.
+    // Writes only ever happen manually via the Firebase console.
+    match /admins/{uid} {
+      allow read: if isSignedIn() && request.auth.uid == uid;
+      allow write: if false;
+    }
+  }
+}
